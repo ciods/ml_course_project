@@ -1,0 +1,152 @@
+---
+title: "Activity prediction in HAR data set"
+author: "ciods"
+date: "11/3/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+The purpose of this report is to build a statistical model that will predict how well certain exercises were performed by a group of six individuals. Particularly, each of them was asked to perform barbell lifts in 5 different ways, only one of which was correct. In our analysis we'll use data provided by the [Human Activity Recognition](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har) project.  
+
+## Model building strategy
+After performing some exploratory data analysis it became obvious that special considerations should be taken in order to build our model given limited resources (time, computer power). Simply trying out different models proved to be quite inefficient due to data size and rather large number of variables (almost 20,000 observations, and about 160 predictors).  
+Thus, my approach was to **1)** use cross-validation data sets, **2)** considerably limit the number of variables, focusing only on most significant ones, **3)** train few models that could potentially bring the best results given what we've learned about the data during exploratory phase. And finally, **4)** choose the best model so far, and try to predict the outcomes in the testing data set.  
+*(NB)* I've sacrificed a little bit of accuracy in order to produce this report in a limited time frame. A 100% accuracy is *NOT* the goal of this project after all.
+
+## Data analysis
+Load the raw data:
+```{r cache=TRUE}
+if ( ! file.exists("pml-training.csv") ) {
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+              destfile = "pml-training.csv")
+}
+
+if ( ! file.exists("pml-testing.csv") ) {
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+              destfile = "pml-testing.csv")
+}
+
+training <- read.csv("pml-training.csv")
+testing <- read.csv("pml-testing.csv")
+```
+
+Getting some sense of the data size and structure:
+```{r}
+dim(training)
+dim(testing)
+#str(training)
+```
+
+Remove a whole slew of variables which are either redundant or not relevant for our analysis. For example, I've decided to get rid of the aggregates, and use specific measurements instead (i.e. use *accel_arm_x/y/z* instead of *total_accel_arm*, and so forth).
+```{r}
+library(ggplot2)
+library(lattice)
+library(caret)
+
+# remove variables we chose not to use
+removeCols <- "^(max|min|avg|var|total|stddev|amplitude|skewness)_|_(timestamp|window)|X|user_name|problem_id"
+colTrain <- grepl(removeCols, names(training), perl = TRUE)
+colTest <- grepl(removeCols, names(testing), perl = TRUE)
+training <- training[, !colTrain]
+testing <- testing[, !colTest]
+
+dim(training)
+```
+
+Now will look into (and exclude) variables that do not carry much variation (i.e. more or less constant across all observations).
+```{r}
+# find near zero covariates, because they have no real value for our prediction (less meaningful predictors)
+nzv <- nearZeroVar(training[, !names(training) %in% "classe"], saveMetrics = TRUE)
+nzvCols <- rownames(nzv[nzv$nzv == TRUE, ])
+training <- training[, !names(training) %in% nzvCols]
+testing <- testing[, !names(testing) %in% nzvCols]
+
+dim(training)
+dim(testing)
+```
+
+I've also decided to further reduce the number of variables in order to speed up the processing. Since similar measurements were taken from sensors attached to the arm, belt, dumbbell, and forearm, I've decided to focus on "belt" measurements only to building prediction models. Actually, I'll skip the details for brevity, but what I've done was, I've split all the predictors in four distinct groups (arm, belt, dumbbell, forearm), and ran a few models (rpart, lda, rf) against each group, with a much smaller subset of the training data set. In the end, I've noticed "belt" predictors were producing most accurate results.  
+
+## Data modeling
+As mentioned above, from the selected predictors we'll choose only those which have the word "belt" in the name.
+```{r}
+# focus on most promising variables
+colPattern <- "_belt_|_belt$"
+
+selCol <- grep(colPattern, names(training), value = TRUE, perl = TRUE)
+training <- training[, c("classe", selCol)]
+sort(names(training))
+
+selCol <- grep(colPattern, names(testing), value = TRUE, perl = TRUE)
+testing <- testing[, selCol]
+sort(names(testing))
+```
+So, the refined data set has only 12 variables (down from 160!), plus the outcome (classe). This will buy us a lot of processing performance benefits, at the expence of (hopefully) a bit lower accuracy.   
+
+Setting the seed for reproducibility, we'll now create our cross-validation set. I'll leave 70% for the training, and 30% for cross-validation.
+```{r}
+set.seed(12345)
+idx <- createDataPartition(training$classe, p=0.7, list = FALSE)
+trn <- training[idx,]
+crv <- training[-idx,]
+
+dim(trn)
+dim(crv)
+```
+
+So, at last we've arrived at a more or less manageable number of predictors (12). Let's run some feature plots, in a hope to discover any sort of pattern. Perhaps, we could use linear regression to fit our model. Due to space constrains and presentation considerations, I'll plot only a select number of variables. However, it must be noted that similar results are produced when running against all predictors.
+
+```{r fig.align='center',fig.width=8,fig.height=8}
+df <- data.frame(classe=as.numeric(trn$classe), trn[, grep("_belt$", names(trn), value = TRUE)])
+featurePlot(x=df, y=df$classe, plot="pairs")
+```
+
+Clearly, there is hardly any trace of *linear dependency* between our outcome (classe) and any of the predictors...
+We do see however some sort of clustering in the data. Therefore, we'll try some other, non-linear models, perhaps classification trees, random forest, etc.  
+
+Now will train few models on our refined training subset.
+```{r message=FALSE,results=FALSE}
+library(caret)
+mdl_gbm <- train(classe ~ ., method = "gbm", data=trn)
+mdl_rf <- train(classe ~ ., method = "rf", data=trn)
+mdl_rpart <- train(classe ~ ., method = "rpart", data=trn)
+```
+
+... and check the accuracy (in the training set).
+```{r}
+pred1 <- predict(mdl_gbm, trn)
+pred2 <- predict(mdl_rf, trn)
+pred3 <- predict(mdl_rpart, trn)
+```
+
+```{r}
+conf1 <- confusionMatrix(pred1, trn$classe); conf1$table; conf1$overall[1]
+conf2 <- confusionMatrix(pred2, trn$classe); conf2$table; conf2$overall[1]
+conf3 <- confusionMatrix(pred3, trn$classe); conf3$table; conf3$overall[1]
+#table(pred1, pred2)
+```
+Thus, the accuracies for these models are as follows:  
+* Stochastic Gradient Boosting (gbm) -- `r I(round(conf1$overall[1]*100,1))`%  
+* Random Forest (rf) -- `r I(round(conf2$overall[1]*100,1))`%  
+* Classification tree (rpart) -- `r I(round(conf3$overall[1]*100,1))`%.  
+  
+We can see that Random Forest algorithm outperforms the remaining two for this particular data set, therefore we'll use rf to test our in-sample accuracy in cross-validation.
+
+```{r}
+pred_crv <- predict(mdl_rf, newdata = crv)
+cm_crv <- confusionMatrix(pred_crv, crv$classe); cm_crv$table; cm_crv$overall[1]
+```
+We see that the accuracy dropped a little in cross-validation, however this is still a very good result. This confirms it once again that Random Forest algorithm is very well suited for our data set. Therefore, we are quite ready to run our predictions on the testing data.  
+
+Given the accuracy in cross-validation, we estimate the out-of-sample error to be `r I(1-round(cm_crv$overall[1],2))`. Let's not forget we've used less than 10% of the predictors in the data set.  
+
+```{r}
+predict(mdl_rf, newdata = testing)
+```
+
+## Conclusion
+We've managed to fit a model that produces pretty good results using just a fraction of the predictors. Given an opportunity to use more powerful computers, more accurate predictions would have been possible if we included more of the available variables, and/or trained some of the other classification models.
